@@ -10,7 +10,7 @@ require (
 	github.com/cometbft/cometbft v0.38.26
 	github.com/cosmos/cosmos-sdk v0.50.11
 	github.com/cosmos/gogoproto v1.7.0
-	github.com/ethereum/go-ethereum v1.17.0
+	github.com/ethereum/go-ethereum v1.13.5
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
@@ -42,9 +42,9 @@ require (
 	cosmossdk.io/x/tx v0.13.7 // indirect
 	filippo.io/edwards25519 v1.0.0 // indirect
 	github.com/DataDog/zstd v1.5.5 // indirect
-	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
+	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
