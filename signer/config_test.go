@@ -1,7 +1,6 @@
 package signer_test
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -9,203 +8,25 @@ import (
 	"path/filepath"
 	"testing"
 
-	cometcryptoed25519 "github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/strangelove-ventures/horcrux/v3/signer"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
 )
 
 const testChainID = "test"
 
-func TestConnKeyFilePath(t *testing.T) {
-	homeDir := t.TempDir()
-	keyDir := t.TempDir()
-
-	testCases := []struct {
-		name     string
-		config   signer.Config
-		expected string
-	}{
-		{
-			name:     "unset connKeyFile",
-			config:   signer.Config{},
-			expected: "",
-		},
-		{
-			name:     "relative path resolves against home dir",
-			config:   signer.Config{ConnKeyFile: "conn_key.json"},
-			expected: filepath.Join(homeDir, "conn_key.json"),
-		},
-		{
-			name:     "relative path resolves against key dir when set",
-			config:   signer.Config{ConnKeyFile: "conn_key.json", PrivValKeyDir: &keyDir},
-			expected: filepath.Join(keyDir, "conn_key.json"),
-		},
-		{
-			name:     "empty key dir falls back to the home dir",
-			config:   signer.Config{ConnKeyFile: "conn_key.json", PrivValKeyDir: new(string)},
-			expected: filepath.Join(homeDir, "conn_key.json"),
-		},
-		{
-			name:     "absolute path is used as-is",
-			config:   signer.Config{ConnKeyFile: filepath.Join(keyDir, "elsewhere.json")},
-			expected: filepath.Join(keyDir, "elsewhere.json"),
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := signer.RuntimeConfig{HomeDir: homeDir, Config: tc.config}
-			require.Equal(t, tc.expected, c.ConnKeyFilePath())
-		})
-	}
-}
-
-func TestChainNodeConnPubKey(t *testing.T) {
-	pubKey := cometcryptoed25519.GenPrivKey().PubKey()
-
-	t.Run("no pin configured", func(t *testing.T) {
-		got, err := signer.ChainNode{PrivValAddr: "tcp://127.0.0.1:1234"}.ConnPubKey()
-		require.NoError(t, err)
-		require.Nil(t, got)
-	})
-
-	t.Run("pinned node returns the expected public key", func(t *testing.T) {
-		cn := signer.ChainNode{
-			PrivValAddr:   "tcp://127.0.0.1:1234",
-			ConnPubKeyHex: hex.EncodeToString(pubKey.Bytes()),
-		}
-
-		got, err := cn.ConnPubKey()
-		require.NoError(t, err)
-		require.True(t, got.Equals(pubKey))
-	})
-
-	t.Run("malformed pin is an error", func(t *testing.T) {
-		cn := signer.ChainNode{
-			PrivValAddr:   "tcp://127.0.0.1:1234",
-			ConnPubKeyHex: "beefbeef",
-		}
-
-		_, err := cn.ConnPubKey()
-		require.Error(t, err)
-	})
-
-	t.Run("validate rejects a malformed pin", func(t *testing.T) {
-		cns := signer.ChainNodes{{
-			PrivValAddr:   "tcp://127.0.0.1:1234",
-			ConnPubKeyHex: "beefbeef",
-		}}
-
-		require.Error(t, cns.Validate())
-	})
-}
-
-func TestConfigYamlConnAuth(t *testing.T) {
-	pubKey := cometcryptoed25519.GenPrivKey().PubKey()
-
-	raw := fmt.Sprintf(`signMode: threshold
-connKeyFile: conn_key.json
-chainNodes:
-- privValAddr: tcp://10.168.0.1:1234
-  connPubKey: %s
-- privValAddr: tcp://10.168.0.2:1234
-`, hex.EncodeToString(pubKey.Bytes()))
-
-	var c signer.Config
-	require.NoError(t, yaml.Unmarshal([]byte(raw), &c))
-
-	require.Equal(t, "conn_key.json", c.ConnKeyFile)
-	require.Len(t, c.ChainNodes, 2)
-
-	pinned, err := c.ChainNodes[0].ConnPubKey()
-	require.NoError(t, err)
-	require.True(t, pinned.Equals(pubKey))
-
-	unpinned, err := c.ChainNodes[1].ConnPubKey()
-	require.NoError(t, err)
-	require.Nil(t, unpinned)
-}
-
-func TestConfigYamlLeaderOnlyChainNodeConnections(t *testing.T) {
-	raw := `signMode: threshold
-thresholdMode:
-  threshold: 2
-  leaderOnlyChainNodeConnections: true
-chainNodes:
-- privValAddr: tcp://10.168.0.1:1234
-`
-
-	var c signer.Config
-	require.NoError(t, yaml.Unmarshal([]byte(raw), &c))
-	require.True(t, c.ThresholdModeConfig.LeaderOnlyChainNodeConnections)
-
-	// The flag defaults to false when absent.
-	var d signer.Config
-	require.NoError(t, yaml.Unmarshal([]byte("thresholdMode:\n  threshold: 2\n"), &d))
-	require.False(t, d.ThresholdModeConfig.LeaderOnlyChainNodeConnections)
-}
-
-func TestClusterPeerPubKeys(t *testing.T) {
-	k1 := cometcryptoed25519.GenPrivKey().PubKey()
-	k2 := cometcryptoed25519.GenPrivKey().PubKey()
-
-	cfg := &signer.ThresholdModeConfig{
-		Cosigners: signer.CosignersConfig{
-			{ShardID: 1, P2PAddr: "tcp://10.0.0.1:2222", TLSPubKey: hex.EncodeToString(k1.Bytes())},
-			{ShardID: 2, P2PAddr: "tcp://10.0.0.2:2222", TLSPubKey: hex.EncodeToString(k2.Bytes())},
-		},
-	}
-
-	require.False(t, cfg.ClusterTLSEnabled())
-	cfg.ClusterKeyFile = "cluster_key.json"
-	require.True(t, cfg.ClusterTLSEnabled())
-
-	keys, err := cfg.ClusterPeerPubKeys()
-	require.NoError(t, err)
-	require.Len(t, keys, 2)
-	require.True(t, keys[0].Equals(k1))
-	require.True(t, keys[1].Equals(k2))
-
-	// A cosigner missing/invalid tlsPubKey makes the allowlist incomplete.
-	cfg.Cosigners[1].TLSPubKey = ""
-	_, err = cfg.ClusterPeerPubKeys()
-	require.Error(t, err)
-}
-
-func TestValidateClusterTLSConfig(t *testing.T) {
-	k1 := hex.EncodeToString(cometcryptoed25519.GenPrivKey().PubKey().Bytes())
-	k2 := hex.EncodeToString(cometcryptoed25519.GenPrivKey().PubKey().Bytes())
-
-	mkConfig := func(tls1, tls2 string) signer.Config {
-		return signer.Config{
-			ThresholdModeConfig: &signer.ThresholdModeConfig{
-				Threshold:      2,
-				ClusterKeyFile: "cluster_key.json",
-				GRPCTimeout:    "500ms",
-				RaftTimeout:    "500ms",
-				Cosigners: signer.CosignersConfig{
-					{ShardID: 1, P2PAddr: "tcp://10.0.0.1:2222", TLSPubKey: tls1},
-					{ShardID: 2, P2PAddr: "tcp://10.0.0.2:2222", TLSPubKey: tls2},
-				},
+func TestNodes(t *testing.T) {
+	c := signer.Config{
+		ChainNodes: signer.ChainNodes{
+			{
+				PrivValAddr: "tcp://0.0.0.0:1234",
 			},
-		}
+			{
+				PrivValAddr: "tcp://0.0.0.0:5678",
+			},
+		},
 	}
 
-	t.Run("distinct tlsPubKeys validate", func(t *testing.T) {
-		c := mkConfig(k1, k2)
-		require.NoError(t, c.ValidateThresholdModeConfig())
-	})
-
-	t.Run("missing tlsPubKey is rejected", func(t *testing.T) {
-		c := mkConfig(k1, "")
-		require.Error(t, c.ValidateThresholdModeConfig())
-	})
-
-	t.Run("duplicate tlsPubKey is rejected", func(t *testing.T) {
-		c := mkConfig(k1, k1)
-		require.Error(t, c.ValidateThresholdModeConfig())
-	})
+	require.Equal(t, []string{"tcp://0.0.0.0:1234", "tcp://0.0.0.0:5678"}, c.Nodes())
 }
 
 func TestValidateSingleSignerConfig(t *testing.T) {

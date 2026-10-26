@@ -61,7 +61,7 @@ func BuildHorcruxImage(ctx context.Context, client *client.Client) error {
 			return err
 		}
 		if dockerLogLine.Stream != "" {
-			fmt.Print(dockerLogLine.Stream)
+			fmt.Printf(dockerLogLine.Stream)
 		}
 		if dockerLogLine.Aux != nil {
 			fmt.Printf("Image ID: %s\n", dockerLogLine.Aux.ID)

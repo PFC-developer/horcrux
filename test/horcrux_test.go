@@ -151,8 +151,6 @@ func TestDownedSigners2of3(t *testing.T) {
 
 	cw, pubKey := startChainSingleNodeAndHorcruxThreshold(
 		ctx, t, totalValidators, totalSigners, threshold, totalSentries, sentriesPerSigner,
-		// Signers are stopped during this test; tolerate the transient missed blocks.
-		modifyGenesisLenientUptime,
 	)
 
 	require.NoError(t, testutil.WaitForBlocks(ctx, 15, cw.chain))
@@ -196,8 +194,6 @@ func TestDownedSigners3of5(t *testing.T) {
 
 	cw, pubKey := startChainSingleNodeAndHorcruxThreshold(
 		ctx, t, totalValidators, totalSigners, threshold, totalSentries, sentriesPerSigner,
-		// Signers are stopped during this test; tolerate the transient missed blocks.
-		modifyGenesisLenientUptime,
 	)
 
 	require.NoError(t, testutil.WaitForBlocks(ctx, 15, cw.chain))
@@ -379,6 +375,7 @@ func TestMultipleChainHorcrux(t *testing.T) {
 		chainConfig := chainConfig
 		preGenesises[i] = func(cw *chainWrapper) func(ibc.ChainConfig) error {
 			return func(cc ibc.ChainConfig) error {
+
 				firstSentry := cw.chain.Validators[0]
 				sentries := append(cosmos.ChainNodes{firstSentry}, cw.chain.FullNodes...)
 
@@ -616,6 +613,7 @@ func TestHorcruxProxyGRPC(t *testing.T) {
 		chainConfig := chainConfig
 		preGenesises[i] = func(cw *chainWrapper) func(ibc.ChainConfig) error {
 			return func(cc ibc.ChainConfig) error {
+
 				firstSentry := cw.chain.Validators[0]
 				sentries := append(cosmos.ChainNodes{firstSentry}, cw.chain.FullNodes...)
 

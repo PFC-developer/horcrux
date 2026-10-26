@@ -1,7 +1,6 @@
 package signer
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -86,19 +85,13 @@ func (cosigner *LocalCosigner) pruneNonces() {
 }
 
 func (cosigner *LocalCosigner) combinedNonces(myID int, threshold uint8, uuid uuid.UUID) ([]Nonce, error) {
-	cosigner.noncesMu.Lock()
-	defer cosigner.noncesMu.Unlock()
+	cosigner.noncesMu.RLock()
+	defer cosigner.noncesMu.RUnlock()
 
 	nonces, ok := cosigner.nonces[uuid]
 	if !ok {
 		return nil, errors.New("no metadata at HRS")
 	}
-
-	// Consume the nonce as it is read, under the write lock. A nonce must be used
-	// for at most one signature: reusing it across two messages lets an observer
-	// recover the private key shard. Deleting here (rather than after signing)
-	// closes the window in which two concurrent requests read the same nonce.
-	delete(cosigner.nonces, uuid)
 
 	combinedNonces := make([]Nonce, 0, threshold)
 
@@ -112,13 +105,6 @@ func (cosigner *LocalCosigner) combinedNonces(myID int, threshold uint8, uuid uu
 			Share:  c.Shares[myID-1],
 			PubKey: c.PubKey,
 		})
-	}
-
-	// A partial signature must draw on at least threshold nonce contributions.
-	// Signing with fewer (e.g. only this cosigner's own) both breaks the protocol
-	// assumption and enables the single-RPC key-extraction attack.
-	if len(combinedNonces) < int(threshold) {
-		return nil, fmt.Errorf("insufficient nonces for signing: have %d, need %d", len(combinedNonces), threshold)
 	}
 
 	return combinedNonces, nil
@@ -233,39 +219,17 @@ func (cosigner *LocalCosigner) sign(req CosignerSignRequest) (CosignerSignRespon
 		return res, err
 	}
 
-	// The vote and the vote extension are distinct messages and must be signed
-	// under distinct nonces. Sharing one UUID would sign both under the same
-	// nonce, from which the private key shard can be recovered.
-	if hasVoteExtensions && req.UUID == req.VoteExtUUID {
-		return res, errors.New("vote and vote extension nonce UUIDs must differ")
-	}
-
 	// This function has multiple exit points.  Only start time can be guaranteed
 	metricsTimeKeeper.SetPreviousLocalSignStart(time.Now())
 
-	var existingSignature []byte
-	err = ccs.lastSignState.errorIfConflictOrRegression(hrst, req.SignBytes)
-	if err != nil && hasVoteExtensions {
-		// A delayed extension request may refer to an already signed vote the
-		// watermark has moved past, when another sentry drove the round forward
-		// while this one retried. Only reuse an exact cached vote, and only within
-		// the height the cosigner is on; never sign an older vote anew. The exact
-		// bound this grants: an extension can be signed for any cached precommit
-		// at the current height, including rounds the watermark has passed —
-		// which a request for a fresh vote at that round does NOT reach. That is
-		// wider than fresh-vote signing, and acceptable because the extension
-		// bytes are domain-separated (CanonicalVoteExtension cannot be repurposed
-		// as a vote or proposal), the vote bytes must match the cache exactly,
-		// and conflicting extensions are not slashable.
-		latest, cached := ccs.lastSignState.GetFromCache(hrst.HRSKey())
-		if cached != nil && cached.Signature != nil &&
-			hrst.Height == latest.Height &&
-			bytes.Equal(cached.SignBytes, req.SignBytes) {
-			existingSignature, err = cached.Signature, nil
-		}
-	}
+	existingSignature, err := ccs.lastSignState.existingSignatureOrErrorIfRegression(hrst, req.SignBytes)
 	if err != nil {
 		return res, err
+	}
+
+	if existingSignature != nil {
+		res.Signature = existingSignature
+		return res, nil
 	}
 
 	defer func() {
@@ -274,34 +238,6 @@ func (cosigner *LocalCosigner) sign(req CosignerSignRequest) (CosignerSignRespon
 		delete(cosigner.nonces, req.VoteExtUUID)
 		cosigner.noncesMu.Unlock()
 	}()
-
-	// existingSignature is only ever set by the passed-round extension fallback
-	// above, which requires hasVoteExtensions. Re-serving the cached share is
-	// safe there alone: the leader's extension retry discards vote shares and
-	// combines only the extension shares, so the vote share's nonce round does
-	// not matter. Every other byte-identical repeat is signed anew under the
-	// request's nonce round so its share can combine with the rest of that round.
-	if existingSignature != nil {
-		res.Signature = existingSignature
-		{
-			// Extensions may change while the vote stays identical. Sign the
-			// requested extension under fresh nonces, leaving the vote state intact.
-			nonces, err := cosigner.combinedNonces(
-				cosigner.GetID(),
-				//nolint:gosec // threshold is bounded by the shard count, a uint8 in the cosigner protocol
-				uint8(cosigner.config.Config.ThresholdModeConfig.Threshold),
-				req.VoteExtUUID,
-			)
-			if err != nil {
-				return CosignerSignResponse{}, err
-			}
-			res.VoteExtensionSignature, err = ccs.signer.Sign(nonces, req.VoteExtensionSignBytes)
-			if err != nil {
-				return CosignerSignResponse{}, err
-			}
-		}
-		return res, nil
-	}
 
 	nonces, err := cosigner.combinedNonces(
 		cosigner.GetID(),
@@ -350,19 +286,12 @@ func (cosigner *LocalCosigner) sign(req CosignerSignRequest) (CosignerSignRespon
 		Step:                   hrst.Step,
 		Signature:              sig,
 		SignBytes:              req.SignBytes,
-		VoteExtensionSignature: voteExtSig,
+		VoteExtensionSignature: res.VoteExtensionSignature,
 	}, &cosigner.pendingDiskWG)
+
 	if err != nil {
-		var sameHRSError *SameHRSError
-		if !errors.As(err, &sameHRSError) {
+		if _, isSameHRSError := err.(*SameHRSError); !isSameHRSError {
 			return res, err
-		}
-		// A signature for this HRS already exists. Returning ours is only safe if
-		// it is for the same block (or differs only by timestamp); if the stored
-		// block differs materially, returning our signature would be a double
-		// sign, so refuse and discard it.
-		if checkErr := ccs.lastSignState.errorIfConflictOrRegression(hrst, req.SignBytes); checkErr != nil {
-			return res, checkErr
 		}
 	}
 
@@ -393,8 +322,8 @@ func (cosigner *LocalCosigner) generateNonces() ([]Nonces, error) {
 }
 
 func (cosigner *LocalCosigner) LoadSignStateIfNecessary(chainID string) error {
-	if err := ValidateChainID(chainID); err != nil {
-		return err
+	if chainID == "" {
+		return fmt.Errorf("chain id cannot be empty")
 	}
 
 	if _, ok := cosigner.chainState.Load(chainID); ok {
@@ -579,19 +508,11 @@ func (cosigner *LocalCosigner) setNonce(uuid uuid.UUID, nonce CosignerNonce) err
 
 func (cosigner *LocalCosigner) SetNoncesAndSign(
 	_ context.Context,
-	req CosignerSetNoncesAndSignRequest,
-) (*CosignerSignResponse, error) {
+	req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
 	chainID := req.ChainID
 
 	if err := cosigner.LoadSignStateIfNecessary(chainID); err != nil {
 		return nil, err
-	}
-
-	if req.Nonces == nil {
-		return nil, fmt.Errorf("nonces are required")
-	}
-	if len(req.VoteExtensionSignBytes) > 0 && req.VoteExtensionNonces == nil {
-		return nil, fmt.Errorf("vote extension nonces are required when signing a vote extension")
 	}
 
 	var eg errgroup.Group

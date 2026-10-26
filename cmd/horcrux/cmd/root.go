@@ -25,8 +25,6 @@ func rootCmd() *cobra.Command {
 	cmd.AddCommand(addressCmd())
 	cmd.AddCommand(createCosignerEd25519ShardsCmd())
 	cmd.AddCommand(createCosignerECIESShardsCmd())
-	cmd.AddCommand(createConnKeyCmd())
-	cmd.AddCommand(createClusterKeyCmd())
 
 	rsaCmd := createCosignerRSAShardsCmd()
 	rsaCmd.Deprecated = `
