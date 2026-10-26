@@ -8,6 +8,7 @@
 package signer
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,15 +22,14 @@ import (
 
 	"github.com/Jille/raft-grpc-leader-rpc/leaderhealth"
 	raftgrpctransport "github.com/Jille/raft-grpc-transport"
-	"github.com/Jille/raftadmin"
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/libs/service"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
 
 var _ Leader = (*RaftStore)(nil)
@@ -62,12 +62,18 @@ type RaftStore struct {
 	logger             log.Logger
 	cosigner           *LocalCosigner
 	thresholdValidator *ThresholdValidator
+
+	// tlsConfig enables mutual TLS on the cluster gRPC server and raft transport
+	// when non-nil; nil uses an insecure transport (the historical default).
+	tlsConfig *tls.Config
 }
 
 // New returns a new Store.
 func NewRaftStore(
 	nodeID string, directory string, bindAddress string, timeout time.Duration,
-	logger log.Logger, cosigner *LocalCosigner, cosigners []Cosigner) *RaftStore {
+	logger log.Logger, cosigner *LocalCosigner, cosigners []Cosigner,
+	tlsConfig *tls.Config,
+) *RaftStore {
 	cosignerRaftStore := &RaftStore{
 		NodeID:      nodeID,
 		RaftDir:     directory,
@@ -77,6 +83,7 @@ func NewRaftStore(
 		logger:      logger,
 		cosigner:    cosigner,
 		Cosigners:   cosigners,
+		tlsConfig:   tlsConfig,
 	}
 
 	cosignerRaftStore.BaseService = *service.NewBaseService(logger, "CosignerRaftStore", cosignerRaftStore)
@@ -102,12 +109,23 @@ func (s *RaftStore) init() error {
 	if err != nil {
 		return err
 	}
-	grpcServer := grpc.NewServer()
+	serverOpts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(recoveryUnaryInterceptor(s.logger)),
+		grpc.StreamInterceptor(recoveryStreamInterceptor(s.logger)),
+		// Accept the peer cosigners' keepalive pings (peerKeepalive) rather than
+		// answering with GOAWAY; MinTime must not exceed the client ping interval.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             peerKeepaliveMinTime,
+			PermitWithoutStream: true,
+		}),
+	}
+	if s.tlsConfig != nil {
+		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(s.tlsConfig)))
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 	proto.RegisterCosignerServer(grpcServer, NewCosignerGRPCServer(s.cosigner, s.thresholdValidator, s))
 	transportManager.Register(grpcServer)
 	leaderhealth.Setup(s.raft, grpcServer, []string{"Leader"})
-	raftadmin.Register(grpcServer, s.raft)
-	reflection.Register(grpcServer)
 	return grpcServer.Serve(sock)
 }
 
@@ -166,7 +184,7 @@ func (s *RaftStore) Open() (*raftgrpctransport.Manager, error) {
 
 	// Setup Raft communication.
 	transportManager := raftgrpctransport.New(raftAddress, []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(ClusterTransportCreds(s.tlsConfig)),
 	})
 
 	// Instantiate the Raft systems.
@@ -399,7 +417,6 @@ func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		// Close the sink.
 		return sink.Close()
 	}()
-
 	if err != nil {
 		f.logger.Error("Snapshot persist error", err.Error())
 		sinkErr := sink.Cancel()

@@ -1,70 +1,57 @@
-FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS build-env
+# Pinned by the multi-arch index digest so a rebuild of the same source always
+# compiles with the same Go toolchain. The C toolchain and musl, which is linked
+# statically into the binary, come from Alpine's package index at build time
+# (apk add below), so they can differ between two builds of the same source.
+# To move the pin: read the new digest with
+# `docker buildx imagetools inspect golang:<tag>` and update the tag and digest
+# together, here and in docker/horcrux/native.Dockerfile — and keep it in step
+# with the GOTOOLCHAIN pin in .github/workflows/govulncheck.yml, which must scan
+# the same Go toolchain this image builds with, and with the toolchain lines in
+# go.work and go.mod. .github/workflows/image.yml fails when any of them differ.
+FROM golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS build-env
 
-RUN apk add --update --no-cache curl make git libc-dev bash gcc linux-headers eudev-dev
+RUN apk add --update --no-cache make git libc-dev bash gcc linux-headers eudev-dev
 
 ARG TARGETARCH
-ARG BUILDARCH
-
-RUN if [ "${TARGETARCH}" = "arm64" ] && [ "${BUILDARCH}" != "arm64" ]; then \
-        wget -c https://musl.cc/aarch64-linux-musl-cross.tgz -O - | tar -xzvv --strip-components 1 -C /usr; \
-    elif [ "${TARGETARCH}" = "amd64" ] && [ "${BUILDARCH}" != "amd64" ]; then \
-        wget -c https://musl.cc/x86_64-linux-musl-cross.tgz -O - | tar -xzvv --strip-components 1 -C /usr; \
-    fi
 
 WORKDIR /horcrux
 
 ADD . .
 
-RUN if [ "${TARGETARCH}" = "arm64" ] && [ "${BUILDARCH}" != "arm64" ]; then \
-        export CC=aarch64-linux-musl-gcc CXX=aarch64-linux-musl-g++;\
-    elif [ "${TARGETARCH}" = "amd64" ] && [ "${BUILDARCH}" != "amd64" ]; then \
-        export CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++; \
-    fi; \
-    GOOS=linux GOARCH=$TARGETARCH CGO_ENABLED=1 LDFLAGS='-linkmode external -extldflags "-static"' make install
+# Build for the target platform with Alpine's native toolchain. buildx runs this
+# stage under QEMU for non-native architectures, so the binary is compiled
+# natively (CGO uses the in-image gcc) with no external cross toolchain fetched,
+# which would be both a reliability and a supply-chain risk.
+RUN GOOS=linux GOARCH=$TARGETARCH CGO_ENABLED=1 LDFLAGS='-linkmode external -extldflags "-static"' make install
 
 RUN if [ -d "/go/bin/linux_${TARGETARCH}" ]; then mv /go/bin/linux_${TARGETARCH}/* /go/bin/; fi
 
-# Use minimal busybox from infra-toolkit image for final scratch image
-FROM ghcr.io/strangelove-ventures/infra-toolkit:v0.0.6 AS busybox-min
+# Build-only donor stage: creates the horcrux user, its passwd entry and its
+# home directory. Only files are copied out of it — never its binary, so the
+# final image carries no shell and no busybox applets.
+FROM busybox:1.34.1-musl@sha256:8d80daaf06e357574a3891b89e4f81d031768a918c4e72e5fbb99fa9d6813eac AS busybox-min
 RUN addgroup --gid 2345 -S horcrux && adduser --uid 2345 -S horcrux -G horcrux
 
-# Use ln and rm from full featured busybox for assembling final image
-FROM busybox:1.34.1-musl AS busybox-full
-
-# Build final image from scratch
+# Final image, assembled by COPY alone: the statically linked horcrux binary,
+# the CA bundle, and the horcrux user. No shell, no utilities, no RUN — code in
+# the container has nothing to execute but horcrux itself.
 FROM scratch
 
-LABEL org.opencontainers.image.source="https://github.com/cosmos/horcrux"
-
-WORKDIR /bin
-
-# Install ln (for making hard links) and rm (for cleanup) from full busybox image (will be deleted, only needed for image assembly)
-COPY --from=busybox-full /bin/ln /bin/rm ./
-
-# Install minimal busybox image as shell binary (will create hardlinks for the rest of the binaries to this data)
-COPY --from=busybox-min /busybox/busybox /bin/sh
-
-# Add hard links for read-only utils, then remove ln and rm
-# Will then only have one copy of the busybox minimal binary file with all utils pointing to the same underlying inode
-RUN ln sh pwd && \
-    ln sh ls && \
-    ln sh cat && \
-    ln sh less && \
-    ln sh grep && \
-    ln sh sleep && \
-    ln sh env && \
-    ln sh tar && \
-    ln sh tee && \
-    ln sh du && \
-    rm ln rm
+LABEL org.opencontainers.image.source="https://github.com/gnolang/horcrux"
 
 # Install chain binaries
-COPY --from=build-env /go/bin/horcrux /bin
+COPY --from=build-env /go/bin/horcrux /bin/horcrux
 
 # Install trusted CA certificates
-COPY --from=busybox-min /etc/ssl/cert.pem /etc/ssl/cert.pem
+COPY --from=build-env /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
 
-# Install horcrux user
+# Install horcrux user. The passwd file is load-bearing twice: it resolves
+# USER horcrux, and the container runtime takes $HOME from its home field.
+# Without an entry for the uid, Docker sets HOME=/ and horcrux looks for its
+# config under /.horcrux. Do not replace the passwd file with a bare numeric
+# USER. Independently of this file, if HOME reaches horcrux unset, its default
+# config-dir lookup execs getent, which this image does not have, and fails;
+# --home skips that lookup.
 COPY --from=busybox-min /etc/passwd /etc/passwd
 COPY --from=busybox-min --chown=2345:2345 /home/horcrux /home/horcrux
 

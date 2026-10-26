@@ -2,6 +2,32 @@
 
 Horcrux is a [multi-party-computation (MPC)](https://en.wikipedia.org/wiki/Secure_multi-party_computation) signing service for CometBFT (Formerly known as Tendermint) nodes
 
+> ## Hardened, maintained fork
+>
+> This is a security-hardened fork of
+> [strangelove-ventures/horcrux](https://github.com/strangelove-ventures/horcrux)
+> (based on `v3.3.2`; upstream is archived). All changes are **opt-in and
+> backward-compatible** — with no new configuration, behavior is identical to
+> upstream `v3.3.2`.
+>
+> - **Security hardening** from two independent audits — closes a nonce-handling
+>   flaw that risked key-material exposure, a residual double-sign path, an
+>   unauthenticated cluster admin surface, and several crash-inducing input paths.
+> - **Dependency & Go toolchain updates** — `govulncheck` reachable vulnerabilities
+>   13 → 0; builds on Go 1.27.
+> - **Optional connection security** — persistent priv-validator connection
+>   authentication, and opt-in mutual TLS between cosigners.
+> - **Broader node compatibility** — opt-in leader-only priv-validator connections
+>   and a spec-compliant sign response, for stricter priv-validator implementations
+>   (e.g. gno.land / tm2).
+> - **Supply chain** — vendored the threshold-ed25519 crypto in-tree (its upstream
+>   GitLab source is archived).
+>
+> See [`docs/FORK.md`](docs/FORK.md) for the full change list and
+> [`docs/authentication.md`](docs/authentication.md) for connection-security setup.
+>
+> **Container image:** `ghcr.io/aeddi/horcrux:main`.
+
 ## Why use Horcrux?
 
 Take your validator infrastructure to the next level of security and availability
@@ -22,7 +48,6 @@ For more on how the Horcrux MPC signing flow works, see [`docs/signing.md`](/doc
 
 ![Screenshot from 2022-03-07 18-09-49](https://user-images.githubusercontent.com/6722152/157145772-8557b4b5-a0cc-4073-8834-86afda1900fc.png)
 
-
 ## Raft
 
 Horcrux v2.x introduces [Raft](https://raft.github.io/) For leader election and high watermark consensus.
@@ -40,6 +65,8 @@ Horcrux signer cluster configured with 5 total nodes, threshold 3.
 ## Running Horcrux
 
 See documentation in [`docs/migrating.md`](/docs/migrating.md) to learn how to upgrade your validator infrastructure with Horcrux.
+
+See [`docs/authentication.md`](/docs/authentication.md) to optionally authenticate the connections between Horcrux and your chain nodes.
 
 ## Security
 

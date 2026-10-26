@@ -2,6 +2,7 @@ package signer
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/url"
 	"time"
@@ -10,8 +11,31 @@ import (
 	"github.com/google/uuid"
 	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
+
+// peerKeepaliveMinTime is the minimum keepalive ping interval the cosigner gRPC
+// server tolerates (its KeepaliveEnforcementPolicy MinTime, see raft_store.go).
+// peerKeepalive.Time must be >= this value or the server GOAWAYs the connection
+// with "too_many_pings".
+const peerKeepaliveMinTime = 5 * time.Second
+
+// peerKeepalive returns the client keepalive parameters that keep the
+// connection to a peer cosigner actively probed, so a peer that has died or
+// gone half-open (TCP up, process gone) is detected and the connection torn
+// down promptly, instead of sign RPCs paying their full per-call deadline
+// against a black hole. A function rather than shared state: the value cannot
+// be mutated. Time must not go below grpc-go's 10s KeepaliveMinPingTime floor
+// (it would be silently clamped) nor below peerKeepaliveMinTime.
+func peerKeepalive() keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:                10 * time.Second,
+		Timeout:             3 * time.Second,
+		PermitWithoutStream: true,
+	}
+}
 
 var _ Cosigner = &RemoteCosigner{}
 
@@ -23,9 +47,11 @@ type RemoteCosigner struct {
 	client proto.CosignerClient
 }
 
-// NewRemoteCosigner returns a newly initialized RemoteCosigner
-func NewRemoteCosigner(id int, address string) (*RemoteCosigner, error) {
-	client, err := getGRPCClient(address)
+// NewRemoteCosigner returns a newly initialized RemoteCosigner. tlsConfig enables
+// mutual TLS to the peer when non-nil; a nil tlsConfig uses an insecure transport
+// (the historical default).
+func NewRemoteCosigner(id int, address string, tlsConfig *tls.Config) (*RemoteCosigner, error) {
+	client, err := getGRPCClient(address, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -63,19 +89,43 @@ func (cosigner *RemoteCosigner) VerifySignature(_ string, _, _ []byte) bool {
 	return false
 }
 
-func getGRPCClient(address string) (proto.CosignerClient, error) {
-	var grpcAddress string
-	url, err := url.Parse(address)
-	if err != nil {
-		grpcAddress = address
-	} else {
+// peerGRPCTarget converts a peer cosigner address into a gRPC target with
+// passthrough resolution: the hostname is resolved by the dialer on every
+// connection attempt. The default dns resolver waits at least 30 seconds
+// between re-resolutions (MinResolutionInterval), so a peer that comes back
+// with a new IP after a restart stays unreachable well past its downtime.
+func peerGRPCTarget(address string) string {
+	grpcAddress := address
+	if url, err := url.Parse(address); err == nil {
 		grpcAddress = url.Host
 	}
-	conn, err := grpc.Dial(grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return "passthrough:///" + grpcAddress
+}
+
+func getGRPCClient(address string, tlsConfig *tls.Config) (proto.CosignerClient, error) {
+	conn, err := grpc.NewClient(
+		peerGRPCTarget(address),
+		grpc.WithTransportCredentials(ClusterTransportCreds(tlsConfig)),
+		grpc.WithKeepaliveParams(peerKeepalive()),
+		grpc.WithLocalDNSResolution(),
+	)
 	if err != nil {
 		return nil, err
 	}
+	// grpc.NewClient is lazy: without this, name resolution and the TCP/TLS
+	// handshake happen inside the first sign RPC, eating into its per-call
+	// deadline (grpcTimeout). Connect starts them immediately instead.
+	conn.Connect()
 	return proto.NewCosignerClient(conn), nil
+}
+
+// ClusterTransportCreds returns mutual-TLS transport credentials when tlsConfig
+// is set, or insecure credentials (the historical default) when it is nil.
+func ClusterTransportCreds(tlsConfig *tls.Config) credentials.TransportCredentials {
+	if tlsConfig == nil {
+		return insecure.NewCredentials()
+	}
+	return credentials.NewTLS(tlsConfig)
 }
 
 // Implements the cosigner interface
@@ -96,6 +146,15 @@ func (cosigner *RemoteCosigner) GetNonces(
 	}
 	out := make(CosignerUUIDNoncesMultiple, len(res.Nonces))
 	for i, nonces := range res.Nonces {
+		// A peer's response is untrusted (and the transport is unauthenticated):
+		// converting a slice shorter than 16 bytes to a UUID array panics, and
+		// this runs in goroutines with no recovery in scope.
+		if len(nonces.Uuid) != uuidLen {
+			return nil, fmt.Errorf(
+				"nonce uuid from cosigner %d must be %d bytes, got %d",
+				cosigner.GetID(), uuidLen, len(nonces.Uuid),
+			)
+		}
 		out[i] = &CosignerUUIDNonces{
 			UUID:   uuid.UUID(nonces.Uuid),
 			Nonces: CosignerNoncesFromProto(nonces.Nonces),
@@ -107,7 +166,8 @@ func (cosigner *RemoteCosigner) GetNonces(
 // Implements the cosigner interface
 func (cosigner *RemoteCosigner) SetNoncesAndSign(
 	ctx context.Context,
-	req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
+	req CosignerSetNoncesAndSignRequest,
+) (*CosignerSignResponse, error) {
 	cosignerReq := &proto.SetNoncesAndSignRequest{
 		Uuid:      req.Nonces.UUID[:],
 		ChainID:   req.ChainID,
@@ -146,8 +206,19 @@ func (cosigner *RemoteCosigner) Sign(
 	if err != nil {
 		return nil, err
 	}
+	// An unset response timestamp means either a leader on a build that predates
+	// the field, or a zero-time signature. Keep the request timestamp then: right
+	// whenever such a leader signed afresh, wrong when it answered from its cache
+	// over another timestamp — a window that closes once every cosigner that can
+	// win an election runs a build that sets the field (docs/signing.md).
+	// A populated timestamp may belong to a cached signature and must be kept.
+	timestamp := req.Block.Timestamp
+	if res.Timestamp != 0 {
+		timestamp = time.Unix(0, res.Timestamp)
+	}
 	return &CosignerSignBlockResponse{
 		Signature:              res.Signature,
 		VoteExtensionSignature: res.VoteExtSignature,
+		Timestamp:              timestamp,
 	}, nil
 }

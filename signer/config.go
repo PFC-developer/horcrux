@@ -6,9 +6,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/cometbft/cometbft/crypto"
+	cometcryptoed25519 "github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/codec/legacy"
 	"github.com/cosmos/cosmos-sdk/codec/types"
@@ -20,6 +22,29 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// maxChainIDLen mirrors CometBFT's chain-id length limit.
+const maxChainIDLen = 50
+
+// chainIDPattern is the set of characters allowed in a chain ID. It excludes path
+// separators and "." runs so a chain ID (which is used to build key and state
+// file names) cannot traverse outside its directory.
+var chainIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$`)
+
+// ValidateChainID rejects chain IDs that are empty, too long, or could escape the
+// key/state directory when used to build a file path.
+func ValidateChainID(chainID string) error {
+	if chainID == "" {
+		return fmt.Errorf("chain id cannot be empty")
+	}
+	if len(chainID) > maxChainIDLen {
+		return fmt.Errorf("chain id too long: %d > %d", len(chainID), maxChainIDLen)
+	}
+	if !chainIDPattern.MatchString(chainID) {
+		return fmt.Errorf("chain id %q contains invalid characters", chainID)
+	}
+	return nil
+}
+
 type SignMode string
 
 const (
@@ -30,19 +55,13 @@ const (
 // Config maps to the on-disk yaml format
 type Config struct {
 	PrivValKeyDir       *string              `yaml:"keyDir,omitempty"`
+	ConnKeyFile         string               `yaml:"connKeyFile,omitempty"`
 	SignMode            SignMode             `yaml:"signMode"`
 	ThresholdModeConfig *ThresholdModeConfig `yaml:"thresholdMode,omitempty"`
 	ChainNodes          ChainNodes           `yaml:"chainNodes"`
 	DebugAddr           string               `yaml:"debugAddr"`
 	GRPCAddr            string               `yaml:"grpcAddr"`
 	MaxReadSize         int                  `yaml:"maxReadSize"`
-}
-
-func (c *Config) Nodes() (out []string) {
-	for _, n := range c.ChainNodes {
-		out = append(out, n.PrivValAddr)
-	}
-	return out
 }
 
 func (c *Config) MustMarshalYaml() []byte {
@@ -91,7 +110,29 @@ func (c *Config) ValidateThresholdModeConfig() error {
 		return err
 	}
 
-	return c.ThresholdModeConfig.Cosigners.Validate()
+	if c.ThresholdModeConfig.ClusterTLSEnabled() {
+		// Every cosigner must carry a valid tlsPubKey so the allowlist is
+		// complete; a partial allowlist would silently leave a peer unauthenticated.
+		keys, err := c.ThresholdModeConfig.ClusterPeerPubKeys()
+		if err != nil {
+			return fmt.Errorf("clusterKeyFile is set, so every cosigner needs a valid tlsPubKey: %w", err)
+		}
+		// Distinct cosigners must have distinct identities; a shared tlsPubKey is an
+		// operator error the pinning allowlist cannot otherwise detect.
+		seen := make(map[string]struct{}, len(keys))
+		for i, k := range keys {
+			h := string(k)
+			if _, dup := seen[h]; dup {
+				return fmt.Errorf(
+					"cosigner shard %d reuses another cosigner's tlsPubKey",
+					c.ThresholdModeConfig.Cosigners[i].ShardID,
+				)
+			}
+			seen[h] = struct{}{}
+		}
+	}
+
+	return nil
 }
 
 type RuntimeConfig struct {
@@ -130,43 +171,56 @@ func (c RuntimeConfig) CosignerSecurityRSA() (*CosignerSecurityRSA, error) {
 	return NewCosignerSecurityRSA(key), nil
 }
 
-func (c RuntimeConfig) cachedKeyDirectory() string {
-	if c.Config.PrivValKeyDir != nil {
+// KeyDirectory returns the directory holding key material: the configured
+// keyDir when set, otherwise the home directory.
+func (c RuntimeConfig) KeyDirectory() string {
+	if c.Config.PrivValKeyDir != nil && *c.Config.PrivValKeyDir != "" {
 		return *c.Config.PrivValKeyDir
 	}
-	return ""
+	return c.HomeDir
 }
 
 func (c RuntimeConfig) KeyFilePathSingleSigner(chainID string) string {
-	keyDir := c.HomeDir
-	if kd := c.cachedKeyDirectory(); kd != "" {
-		keyDir = kd
-	}
-	return filepath.Join(keyDir, fmt.Sprintf("%s_priv_validator_key.json", chainID))
+	return filepath.Join(c.KeyDirectory(), fmt.Sprintf("%s_priv_validator_key.json", chainID))
 }
 
 func (c RuntimeConfig) KeyFilePathCosigner(chainID string) string {
-	keyDir := c.HomeDir
-	if kd := c.cachedKeyDirectory(); kd != "" {
-		keyDir = kd
-	}
-	return filepath.Join(keyDir, fmt.Sprintf("%s_shard.json", chainID))
+	return filepath.Join(c.KeyDirectory(), fmt.Sprintf("%s_shard.json", chainID))
 }
 
 func (c RuntimeConfig) KeyFilePathCosignerRSA() string {
-	keyDir := c.HomeDir
-	if kd := c.cachedKeyDirectory(); kd != "" {
-		keyDir = kd
-	}
-	return filepath.Join(keyDir, "rsa_keys.json")
+	return filepath.Join(c.KeyDirectory(), "rsa_keys.json")
 }
 
 func (c RuntimeConfig) KeyFilePathCosignerECIES() string {
-	keyDir := c.HomeDir
-	if kd := c.cachedKeyDirectory(); kd != "" {
-		keyDir = kd
+	return filepath.Join(c.KeyDirectory(), "ecies_keys.json")
+}
+
+// ConnKeyFilePath returns the path of the persistent connection key file, or an
+// empty string when no connKeyFile is configured. A relative connKeyFile
+// resolves against the key directory.
+func (c RuntimeConfig) ConnKeyFilePath() string {
+	if c.Config.ConnKeyFile == "" {
+		return ""
 	}
-	return filepath.Join(keyDir, "ecies_keys.json")
+	if filepath.IsAbs(c.Config.ConnKeyFile) {
+		return c.Config.ConnKeyFile
+	}
+	return filepath.Join(c.KeyDirectory(), c.Config.ConnKeyFile)
+}
+
+// ClusterKeyFilePath returns the path of the cosigner mutual-TLS cluster identity
+// key, or empty when cluster TLS is not configured. A relative clusterKeyFile
+// resolves against the key directory.
+func (c RuntimeConfig) ClusterKeyFilePath() string {
+	if c.Config.ThresholdModeConfig == nil || c.Config.ThresholdModeConfig.ClusterKeyFile == "" {
+		return ""
+	}
+	f := c.Config.ThresholdModeConfig.ClusterKeyFile
+	if filepath.IsAbs(f) {
+		return f
+	}
+	return filepath.Join(c.KeyDirectory(), f)
 }
 
 func (c RuntimeConfig) PrivValStateFile(chainID string) string {
@@ -218,10 +272,40 @@ func (c RuntimeConfig) KeyFileExistsCosignerECIES() (string, error) {
 
 // ThresholdModeConfig is the on disk config format for threshold sign mode.
 type ThresholdModeConfig struct {
-	Threshold   int             `yaml:"threshold"`
-	Cosigners   CosignersConfig `yaml:"cosigners"`
-	GRPCTimeout string          `yaml:"grpcTimeout"`
-	RaftTimeout string          `yaml:"raftTimeout"`
+	Threshold int             `yaml:"threshold"`
+	Cosigners CosignersConfig `yaml:"cosigners"`
+	// ClusterKeyFile, when set, enables mutual TLS on the cosigner cluster
+	// transport using the ed25519 identity in this file. Each cosigner entry must
+	// then carry a tlsPubKey, and those keys form the peer allowlist.
+	ClusterKeyFile string `yaml:"clusterKeyFile,omitempty"`
+	GRPCTimeout    string `yaml:"grpcTimeout"`
+	RaftTimeout    string `yaml:"raftTimeout"`
+	// LeaderOnlyChainNodeConnections, when true, makes only the current raft
+	// leader hold priv-validator connections to the chain nodes; followers park
+	// until elected. Required for nodes whose privval listener holds a single
+	// signer connection (tm2/gno.land). Leave false (the default) when each
+	// cosigner dials its own distinct sentries: those sentries expect a
+	// connection from their assigned cosigner regardless of leadership.
+	LeaderOnlyChainNodeConnections bool `yaml:"leaderOnlyChainNodeConnections,omitempty"`
+}
+
+// ClusterTLSEnabled reports whether cosigner mutual TLS is configured.
+func (cfg *ThresholdModeConfig) ClusterTLSEnabled() bool {
+	return cfg.ClusterKeyFile != ""
+}
+
+// ClusterPeerPubKeys returns the ed25519 public keys of all cosigners, forming
+// the mutual-TLS peer allowlist.
+func (cfg *ThresholdModeConfig) ClusterPeerPubKeys() ([]cometcryptoed25519.PubKey, error) {
+	out := make([]cometcryptoed25519.PubKey, 0, len(cfg.Cosigners))
+	for _, c := range cfg.Cosigners {
+		pub, err := connPubKeyFromHex(c.TLSPubKey)
+		if err != nil {
+			return nil, fmt.Errorf("cosigner shard %d tlsPubKey: %w", c.ShardID, err)
+		}
+		out = append(out, pub)
+	}
+	return out, nil
 }
 
 func (cfg *ThresholdModeConfig) LeaderElectMultiAddress() (string, error) {
@@ -236,6 +320,9 @@ func (cfg *ThresholdModeConfig) LeaderElectMultiAddress() (string, error) {
 type CosignerConfig struct {
 	ShardID int    `yaml:"shardID"`
 	P2PAddr string `yaml:"p2pAddr"`
+	// TLSPubKey is the hex ed25519 public key of this cosigner's cluster identity,
+	// used for the mutual-TLS allowlist when clusterKeyFile is set.
+	TLSPubKey string `yaml:"tlsPubKey,omitempty"`
 }
 
 type CosignersConfig []CosignerConfig
@@ -315,10 +402,33 @@ func CosignersFromFlag(cosigners []string) (out []CosignerConfig, err error) {
 
 type ChainNode struct {
 	PrivValAddr string `json:"privValAddr" yaml:"privValAddr"`
+	// ConnPubKeyHex is the hex encoded ed25519 public key of the chain node's
+	// connection identity, empty when the node is not authenticated.
+	ConnPubKeyHex string `json:"connPubKey,omitempty" yaml:"connPubKey,omitempty"`
+}
+
+// ConnPubKey returns the connection public key the chain node is required to
+// present during the privval handshake, or nil when the node is not
+// authenticated.
+func (cn ChainNode) ConnPubKey() (cometcryptoed25519.PubKey, error) {
+	if cn.ConnPubKeyHex == "" {
+		return nil, nil
+	}
+
+	pubKey, err := connPubKeyFromHex(cn.ConnPubKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("chain node %s: %w", cn.PrivValAddr, err)
+	}
+
+	return pubKey, nil
 }
 
 func (cn ChainNode) Validate() error {
-	_, err := url.Parse(cn.PrivValAddr)
+	if _, err := url.Parse(cn.PrivValAddr); err != nil {
+		return err
+	}
+
+	_, err := cn.ConnPubKey()
 	return err
 }
 

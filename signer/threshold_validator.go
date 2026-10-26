@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/protoio"
+	cometproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cometrpcjsontypes "github.com/cometbft/cometbft/rpc/jsonrpc/types"
 	"github.com/google/uuid"
 	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
@@ -166,7 +168,9 @@ func (pv *ThresholdValidator) SaveLastSignedStateInitiated(
 
 	if _, ok := err.(*SameHRSError); !ok {
 		if sameBlockErr == nil {
-			return existingSignature, existingVoteExtSignature, block.Timestamp, nil
+			// existingTimestamp, not the requested one: the signature returned here can
+			// be an existing one made over a different timestamp.
+			return existingSignature, existingVoteExtSignature, existingTimestamp, nil
 		}
 		return nil, nil, existingTimestamp, pv.newBeyondBlockError(chainID, block.HRSKey())
 	}
@@ -265,6 +269,11 @@ func (pv *ThresholdValidator) Stop() {
 	pv.waitForSignStatesToFlushToDisk()
 }
 
+// IsLeader reports whether this cosigner currently leads the signer cluster.
+func (pv *ThresholdValidator) IsLeader() bool {
+	return pv.leader.IsLeader()
+}
+
 // waitForSignStatesToFlushToDisk waits for any sign states to finish writing to disk.
 func (pv *ThresholdValidator) waitForSignStatesToFlushToDisk() {
 	pv.pendingDiskWG.Wait()
@@ -309,24 +318,34 @@ func (block Block) HRSTKey() HRSTKey {
 }
 
 func (block Block) ToProto() *proto.Block {
-	return &proto.Block{
+	pb := &proto.Block{
 		Height:           block.Height,
 		Round:            block.Round,
 		Step:             int32(block.Step),
 		SignBytes:        block.SignBytes,
 		VoteExtSignBytes: block.VoteExtensionSignBytes,
-		Timestamp:        block.Timestamp.UnixNano(),
 	}
+	// UnixNano is undefined outside years 1678-2262; a zero time is carried as
+	// the unset sentinel (0) so it survives the round trip as zero instead of
+	// reconstructing as a year-1754 garbage timestamp on the other side.
+	if !block.Timestamp.IsZero() {
+		pb.Timestamp = block.Timestamp.UnixNano()
+	}
+	return pb
 }
 
 func BlockFromProto(block *proto.Block) Block {
+	var timestamp time.Time
+	if block.Timestamp != 0 {
+		timestamp = time.Unix(0, block.Timestamp)
+	}
 	return Block{
 		Height:                 block.Height,
 		Round:                  block.Round,
 		Step:                   int8(block.Step),
 		SignBytes:              block.SignBytes,
 		VoteExtensionSignBytes: block.VoteExtSignBytes,
-		Timestamp:              time.Unix(0, block.Timestamp),
+		Timestamp:              timestamp,
 	}
 }
 
@@ -376,6 +395,9 @@ func newSameBlockError(chainID string, hrs HRSKey) *SameBlockError {
 }
 
 func (pv *ThresholdValidator) LoadSignStateIfNecessary(chainID string) error {
+	if err := ValidateChainID(chainID); err != nil {
+		return err
+	}
 	if _, ok := pv.chainState.Load(chainID); ok {
 		return nil
 	}
@@ -441,9 +463,18 @@ func (pv *ThresholdValidator) compareBlockSignatureAgainstSSC(
 		}
 	}
 
+	// An existing signature is never paired with the requested timestamp: the chain
+	// node stamps its message with whatever the signer returns, so the timestamp has
+	// to be the one the existing signature was made over. They are the same when the
+	// payloads are identical, and differ for the two cases below.
+	existingStamp, err := signBytesTimestamp(existingSignature.Step, existingSignature.SignBytes)
+	if err != nil {
+		return nil, nil, stamp, err
+	}
+
 	// If a proposal has already been signed for this HRS, or the sign payload is identical, return the existing signature.
 	if block.Step == stepPropose || bytes.Equal(signBytes, existingSignature.SignBytes) {
-		return existingSignature.Signature, existingSignature.VoteExtensionSignature, block.Timestamp, nil
+		return existingSignature.Signature, existingSignature.VoteExtensionSignature, existingStamp, nil
 	}
 
 	// If there is a difference in the existing signature payload other than timestamp, return that error.
@@ -451,8 +482,32 @@ func (pv *ThresholdValidator) compareBlockSignatureAgainstSSC(
 		return nil, nil, stamp, err
 	}
 
-	// only differ by timestamp, okay to sign again
-	return nil, nil, stamp, nil
+	// Only differ by timestamp: return the existing signature instead of signing
+	// again. Signing again yields a second, equally valid signature over the same
+	// height/round/step, which every peer that already holds the first one rejects
+	// as ErrVoteNonDeterministicSignature. This mirrors what a chain node's own
+	// file-based signer does with its state file (CometBFT FilePV.signVote /
+	// gno.land tm2 PrivValidator.SignVote): reuse the last signature and its timestamp.
+	return existingSignature.Signature, existingSignature.VoteExtensionSignature, existingStamp, nil
+}
+
+// signBytesTimestamp returns the timestamp a set of canonical sign bytes was signed over.
+func signBytesTimestamp(step int8, signBytes []byte) (time.Time, error) {
+	if step == stepPropose {
+		var proposal cometproto.CanonicalProposal
+		if err := protoio.UnmarshalDelimited(signBytes, &proposal); err != nil {
+			return time.Time{}, newUnmarshalError("signBytes", "proposal", err)
+		}
+
+		return proposal.Timestamp, nil
+	}
+
+	var vote cometproto.CanonicalVote
+	if err := protoio.UnmarshalDelimited(signBytes, &vote); err != nil {
+		return time.Time{}, newUnmarshalError("signBytes", "vote", err)
+	}
+
+	return vote.Timestamp, nil
 }
 
 // compareBlockSignatureAgainstHRS returns a BeyondBlockError if the hrs is greater than the
@@ -483,8 +538,11 @@ func (pv *ThresholdValidator) getNoncesFallback(
 	drainedNonceCache.Inc()
 	totalDrainedNonceCache.Inc()
 
-	var wg sync.WaitGroup
-	wg.Add(pv.threshold)
+	// The workers below end when their cosigner call returns; bounding the calls
+	// here makes that self-contained instead of relying on a deadline further up
+	// the request path.
+	ctx, cancel := context.WithTimeout(ctx, pv.grpcTimeout)
+	defer cancel()
 
 	var mu sync.Mutex
 
@@ -498,31 +556,25 @@ func (pv *ThresholdValidator) getNoncesFallback(
 	copy(allCosigners[1:], pv.peerCosigners)
 
 	var thresholdNonces CosignersAndNonces
+	// Closed under mu by whichever cosigner completes the threshold. A channel
+	// rather than a WaitGroup: a count that errors can leave short would pin a
+	// waiter goroutine forever, leaking one per failed fallback — the worker
+	// goroutines themselves always end when their bounded cosigner call returns.
+	// An unreachable threshold (misconfiguration) never closes the channel and
+	// the fallback times out, instead of returning an empty nonce set.
+	thresholdReached := make(chan struct{})
 
 	for _, c := range allCosigners {
-		go pv.waitForPeerNonces(ctx, uuids, c, &wg, &thresholdNonces, &mu)
+		go pv.waitForPeerNonces(ctx, uuids, c, thresholdReached, &thresholdNonces, &mu)
 	}
 
 	// Wait for threshold cosigners to be complete
 	// A Cosigner will either respond in time, or be cancelled with timeout
-	if waitUntilCompleteOrTimeout(&wg, pv.grpcTimeout) {
-		return nil, errors.New("timed out waiting for ephemeral shares")
-	}
-
-	return &thresholdNonces, nil
-}
-
-func waitUntilCompleteOrTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	c := make(chan struct{})
-	go func() {
-		defer close(c)
-		wg.Wait()
-	}()
 	select {
-	case <-c:
-		return false // completed normally
-	case <-time.After(timeout):
-		return true // timed out
+	case <-thresholdReached:
+		return &thresholdNonces, nil
+	case <-time.After(pv.grpcTimeout):
+		return nil, errors.New("timed out waiting for ephemeral shares")
 	}
 }
 
@@ -535,7 +587,7 @@ func (pv *ThresholdValidator) waitForPeerNonces(
 	ctx context.Context,
 	uuids []uuid.UUID,
 	peer Cosigner,
-	wg *sync.WaitGroup,
+	thresholdReached chan<- struct{},
 	thresholdNonces *CosignersAndNonces,
 	mu sync.Locker,
 ) {
@@ -553,26 +605,30 @@ func (pv *ThresholdValidator) waitForPeerNonces(
 	missedNonces.WithLabelValues(peer.GetAddress()).Set(0)
 	timedCosignerNonceLag.WithLabelValues(peer.GetAddress()).Observe(time.Since(peerStartTime).Seconds())
 
-	// Check so that wg.Done is not called more than (threshold - 1) times which causes hardlock
 	mu.Lock()
-	if len(thresholdNonces.Cosigners) < pv.threshold {
-		thresholdNonces.Cosigners = append(thresholdNonces.Cosigners, peer)
-		for _, n := range peerNonces {
-			var found bool
-			for _, nn := range thresholdNonces.Nonces {
-				if n.UUID == nn.UUID {
-					nn.Nonces = append(nn.Nonces, n.Nonces...)
-					found = true
-					break
-				}
-			}
-			if !found {
-				thresholdNonces.Nonces = append(thresholdNonces.Nonces, n)
+	defer mu.Unlock()
+	// A late success past the threshold must not touch the result the caller may
+	// already be reading, and must not close the channel twice.
+	if len(thresholdNonces.Cosigners) >= pv.threshold {
+		return
+	}
+	thresholdNonces.Cosigners = append(thresholdNonces.Cosigners, peer)
+	for _, n := range peerNonces {
+		var found bool
+		for _, nn := range thresholdNonces.Nonces {
+			if n.UUID == nn.UUID {
+				nn.Nonces = append(nn.Nonces, n.Nonces...)
+				found = true
+				break
 			}
 		}
-		defer wg.Done()
+		if !found {
+			thresholdNonces.Nonces = append(thresholdNonces.Nonces, n)
+		}
 	}
-	mu.Unlock()
+	if len(thresholdNonces.Cosigners) == pv.threshold {
+		close(thresholdReached)
+	}
 }
 
 func (pv *ThresholdValidator) proxyIfNecessary(
@@ -630,7 +686,109 @@ func (pv *ThresholdValidator) proxyIfNecessary(
 		}
 		return true, nil, nil, stamp, err
 	}
-	return true, signRes.Signature, signRes.VoteExtensionSignature, stamp, nil
+	// The leader may have answered from an existing signature for this HRS, which
+	// is made over its timestamp, not ours. Return the leader's timestamp so the
+	// chain node stamps the vote the signature actually covers.
+	return true, signRes.Signature, signRes.VoteExtensionSignature, signRes.Timestamp, nil
+}
+
+// voteExtensionNonces draws the two nonce rounds a vote extension retry needs,
+// preferring the prepared cache. Going straight to getNoncesFallback would make
+// every retry look like a drained cache to the operator's metrics.
+func (pv *ThresholdValidator) voteExtensionNonces(ctx context.Context) (*CosignersAndNonces, error) {
+	fastest := pv.cosignerHealth.GetFastest()
+	if len(fastest) >= pv.threshold-1 {
+		cosigners := make(Cosigners, pv.threshold)
+		cosigners[0] = pv.myCosigner
+		copy(cosigners[1:], fastest[:pv.threshold-1])
+
+		if voteNonces, err := pv.nonceCache.GetNonces(cosigners); err == nil {
+			// The vote round is spent even if the extension round is missing: a
+			// nonce must never be offered twice.
+			if extNonces, err := pv.nonceCache.GetNonces(cosigners); err == nil {
+				return &CosignersAndNonces{
+					Cosigners: cosigners,
+					Nonces:    CosignerUUIDNoncesMultiple{voteNonces, extNonces},
+				}, nil
+			}
+		}
+	}
+
+	return pv.getNoncesFallback(ctx, 2)
+}
+
+// signVoteExtension signs an extension for a vote whose full signature is already
+// cached. The existing RPC carries the original vote as well so each cosigner
+// still checks its signing state before signing the extension. Only the
+// extension shares are combined: the vote already has its full signature, and
+// the fresh vote shares each cosigner produces alongside are discarded.
+// An error here must not replace the completed vote with a failed-sign marker.
+func (pv *ThresholdValidator) signVoteExtension(
+	ctx context.Context,
+	chainID string,
+	block Block,
+	stamp time.Time,
+) ([]byte, error) {
+	var vote cometproto.CanonicalVote
+	if err := protoio.UnmarshalDelimited(block.SignBytes, &vote); err != nil {
+		return nil, newUnmarshalError("signBytes", "vote", err)
+	}
+	vote.Timestamp = stamp
+	signBytes, err := protoio.MarshalDelimited(&vote)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling cached vote: %w", err)
+	}
+
+	// Keep distinct nonce rounds for the vote and extension. A cosigner that
+	// missed the original vote may need to sign it before it can sign the extension.
+	// Its vote share is discarded; the caller keeps the cached full vote signature.
+	nonces, err := pv.voteExtensionNonces(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting vote extension nonces: %w", err)
+	}
+	// A peer that answers with fewer rounds than requested must not index out of
+	// range: a panic here takes down a signer that is otherwise healthy.
+	if len(nonces.Nonces) < 2 {
+		return nil, fmt.Errorf("got %d nonce rounds for vote extension, need 2", len(nonces.Nonces))
+	}
+
+	shares := make([]PartialSignature, len(nonces.Cosigners))
+	var eg errgroup.Group
+	for i, cosigner := range nonces.Cosigners {
+		eg.Go(func() error {
+			signCtx, cancel := context.WithTimeout(ctx, pv.grpcTimeout)
+			defer cancel()
+			res, err := cosigner.SetNoncesAndSign(signCtx, CosignerSetNoncesAndSignRequest{
+				ChainID: chainID,
+				HRST: HRSTKey{
+					Height: block.Height, Round: block.Round, Step: block.Step, Timestamp: stamp.UnixNano(),
+				},
+				SignBytes:              signBytes,
+				Nonces:                 nonces.Nonces[0].For(cosigner.GetID()),
+				VoteExtensionSignBytes: block.VoteExtensionSignBytes,
+				VoteExtensionNonces:    nonces.Nonces[1].For(cosigner.GetID()),
+			})
+			if err != nil {
+				return fmt.Errorf("cosigner %d signing vote extension: %w", cosigner.GetID(), err)
+			}
+			if len(res.VoteExtensionSignature) == 0 {
+				return fmt.Errorf("cosigner %d returned no vote extension signature", cosigner.GetID())
+			}
+			shares[i] = PartialSignature{ID: cosigner.GetID(), Signature: res.VoteExtensionSignature}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	signature, err := pv.myCosigner.CombineSignatures(chainID, shares)
+	if err != nil {
+		return nil, fmt.Errorf("combining vote extension signatures: %w", err)
+	}
+	if !pv.myCosigner.VerifySignature(chainID, block.VoteExtensionSignBytes, signature) {
+		return nil, errors.New("combined signature for vote extension is not valid")
+	}
+	return signature, nil
 }
 
 func (pv *ThresholdValidator) Sign(
@@ -679,6 +837,33 @@ func (pv *ThresholdValidator) Sign(
 	}
 	if existingSignature != nil {
 		log.Debug("Returning existing signature", "signature", fmt.Sprintf("%x", existingSignature))
+		_, hasVoteExtensions, err := verifySignPayload(chainID, signBytes, voteExtensionSignBytes)
+		if err != nil {
+			return nil, nil, stamp, fmt.Errorf("failed to verify payload: %w", err)
+		}
+		if !hasVoteExtensions {
+			return existingSignature, nil, existingTimestamp, nil
+		}
+		// The vote cache does not identify the extension. Reuse its extension
+		// signature only if it verifies against the extension in this request.
+		if !pv.myCosigner.VerifySignature(chainID, voteExtensionSignBytes, existingVoteExtSig) {
+			// Decide the height bound here, before nonces are drawn or cosigners
+			// contacted. Each cosigner enforces the same bound, but a peer's
+			// refusal crosses the cluster RPC as an untyped string that the
+			// privval handler cannot classify as a refusal, so it would drop the
+			// chain node connection for a condition no retry can change.
+			latest := pv.mustLoadChainState(chainID).lastSignState.LatestHRS()
+			if block.Height != latest.Height {
+				return nil, nil, stamp, newHeightRegressionError(block.Height, latest.Height)
+			}
+			log.Debug("Signing a changed vote extension for an already signed vote")
+			totalVoteExtensionResigns.WithLabelValues(chainID).Inc()
+			existingVoteExtSig, err = pv.signVoteExtension(ctx, chainID, block, existingTimestamp)
+			if err != nil {
+				log.Error("Failed to sign changed vote extension", "err", err.Error())
+				return nil, nil, stamp, err
+			}
+		}
 		return existingSignature, existingVoteExtSig, existingTimestamp, nil
 	}
 

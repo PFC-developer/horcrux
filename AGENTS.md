@@ -2,16 +2,19 @@
 
 *For the edification of 01node.com — and anyone else running threshold
 signers through a Kubernetes operator and learning these lessons the
-expensive way.*
+expensive way. With thanks to the Gno team, whose production-hardened
+fork became this repo's base (2026-10-26).*
 
 ## What this repo is
 
-A fork of [strangelove-ventures/horcrux](https://github.com/strangelove-ventures/horcrux)
-(see [amygdala-labs/horcrux](https://github.com/amygdala-labs/horcrux) for the
-post-rename upstream), kept as a **sync-fork**: `main` tracks upstream releases
-verbatim; our changes are dependency sweeps and build fixes only, tagged
-`vX.Y.Z-pfc.N`. Never diverge functionally from upstream here — if a behavior
-change is needed, it belongs upstream or in a deliberate, documented patch.
+**Base: [gnolang/horcrux](https://github.com/gnolang/horcrux)** (adopted
+2026-10-26; v3.3.2-gno lineage). The Gno team maintains the
+production-hardened line — nonce robustness, vote-extension edge cases, the
+ECIES fixed-width key encoding fix, the grpc NewClient migration — and this
+fork tracks it plus small pin bumps (cometbft 0.38.26, x/net 0.60 as of the
+adoption). The original upstream ([strangelove-ventures], renamed
+[amygdala-labs]) has been inert since 2025; history predating the adoption
+lives on the pre-migration tags. Tag scheme: `vX.Y.Z-pfc.N`.
 
 ## Hard rules (each one paid for)
 
@@ -20,9 +23,11 @@ change is needed, it belongs upstream or in a deliberate, documented patch.
    time without cgo: *"ScalarMult is not available when secp256k1 is built
    without cgo"*. A CGO_ENABLED=0 build looks perfect until a 3-member raft
    cluster signs its first block.
-2. **Do not bump go-ethereum casually.** It is deliberately held at the
-   upstream pin. ECIES is the most sensitive path in the codebase; changes
-   there get a dedicated soak, never a sweep rider.
+2. **ECIES changes ride the gnolang base, never a sweep rider.** The
+   go-ethereum/ECIES path is the most sensitive in the codebase; its one
+   known encoding bug is fixed in the base (fixed-width coordinates +
+   malformed-key rejection, with tests). Any further ECIES change gets a
+   dedicated soak.
 3. **`go.work` must track the toolchain line.** A stale `go 1.21` declaration
    silently breaks every workspace-aware build the moment module
    requirements move. Standalone builds: `GOWORK=off`.

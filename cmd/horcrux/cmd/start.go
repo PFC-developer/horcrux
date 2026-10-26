@@ -71,7 +71,41 @@ func startCmd() *cobra.Command {
 
 			go EnableDebugAndMetrics(cmd.Context(), out)
 
-			services, err = signer.StartRemoteSigners(services, logger, val, config.Config.Nodes(), config.Config.MaxReadSize)
+			connKey, err := loadConfiguredConnKey(config)
+			if err != nil {
+				return err
+			}
+			if connKey != nil {
+				logger.Info(
+					"Authenticating to chain nodes with persistent connection key",
+					"file", config.ConnKeyFilePath(),
+					"pub_key", signer.ConnPubKeyHex(connKey),
+				)
+			}
+
+			// In leader-only mode, gate every chain node connection on raft
+			// leadership so a node holding a single signer slot (tm2/gno.land)
+			// always talks to the current leader.
+			var isLeader func() bool
+			if config.Config.SignMode == signer.SignModeThreshold &&
+				config.Config.ThresholdModeConfig.LeaderOnlyChainNodeConnections {
+				thresholdVal, ok := val.(*signer.ThresholdValidator)
+				if !ok {
+					return fmt.Errorf("leaderOnlyChainNodeConnections requires a threshold validator, got %T", val)
+				}
+				isLeader = thresholdVal.IsLeader
+				logger.Info("Only the cluster leader will connect to chain nodes")
+			}
+
+			services, err = signer.StartRemoteSigners(
+				services,
+				logger,
+				val,
+				config.Config.ChainNodes,
+				config.Config.MaxReadSize,
+				connKey,
+				isLeader,
+			)
 			if err != nil {
 				return fmt.Errorf("failed to start remote signer(s): %w", err)
 			}

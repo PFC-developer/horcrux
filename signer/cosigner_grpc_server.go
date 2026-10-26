@@ -9,6 +9,10 @@ import (
 	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
 )
 
+// uuidLen is the wire length in bytes of a UUID; converting a slice of any other
+// length to the underlying [16]byte array panics.
+const uuidLen = 16
+
 var _ proto.CosignerServer = &CosignerGRPCServer{}
 
 type CosignerGRPCServer struct {
@@ -34,20 +38,39 @@ func (rpc *CosignerGRPCServer) SignBlock(
 	ctx context.Context,
 	req *proto.SignBlockRequest,
 ) (*proto.SignBlockResponse, error) {
-	sig, voteExtSig, _, err := rpc.thresholdValidator.Sign(ctx, req.ChainID, BlockFromProto(req.Block))
+	if req.Block == nil {
+		return nil, fmt.Errorf("block is required")
+	}
+	sig, voteExtSig, stamp, err := rpc.thresholdValidator.Sign(ctx, req.ChainID, BlockFromProto(req.Block))
 	if err != nil {
 		return nil, err
 	}
-	return &proto.SignBlockResponse{
+	res := &proto.SignBlockResponse{
 		Signature:        sig,
 		VoteExtSignature: voteExtSig,
-	}, nil
+	}
+	// UnixNano is undefined outside years 1678-2262: a zero time would encode as
+	// a garbage value that passes the receiver's is-set check. Leave the field
+	// unset instead, which the receiver answers by keeping the request timestamp.
+	// A Unix-epoch time (not zero, UnixNano 0) also encodes as unset; real chain
+	// timestamps are never the epoch, and both readings fall back the same way.
+	if !stamp.IsZero() {
+		res.Timestamp = stamp.UnixNano()
+	}
+	return res, nil
 }
 
 func (rpc *CosignerGRPCServer) SetNoncesAndSign(
 	ctx context.Context,
 	req *proto.SetNoncesAndSignRequest,
 ) (*proto.SetNoncesAndSignResponse, error) {
+	if req.Hrst == nil {
+		return nil, fmt.Errorf("hrst is required")
+	}
+	if len(req.Uuid) != uuidLen {
+		return nil, fmt.Errorf("uuid must be %d bytes, got %d", uuidLen, len(req.Uuid))
+	}
+
 	cosignerReq := CosignerSetNoncesAndSignRequest{
 		ChainID: req.ChainID,
 
@@ -60,7 +83,7 @@ func (rpc *CosignerGRPCServer) SetNoncesAndSign(
 		SignBytes: req.SignBytes,
 	}
 
-	if len(req.VoteExtSignBytes) > 0 && len(req.VoteExtUuid) == 16 {
+	if len(req.VoteExtSignBytes) > 0 && len(req.VoteExtUuid) == uuidLen {
 		cosignerReq.VoteExtensionNonces = &CosignerUUIDNonces{
 			UUID:   uuid.UUID(req.VoteExtUuid),
 			Nonces: CosignerNoncesFromProto(req.VoteExtNonces),
@@ -102,6 +125,9 @@ func (rpc *CosignerGRPCServer) GetNonces(
 ) (*proto.GetNoncesResponse, error) {
 	uuids := make([]uuid.UUID, len(req.Uuids))
 	for i, uuidBytes := range req.Uuids {
+		if len(uuidBytes) != uuidLen {
+			return nil, fmt.Errorf("uuid must be %d bytes, got %d", uuidLen, len(uuidBytes))
+		}
 		uuids[i] = uuid.UUID(uuidBytes)
 	}
 	res, err := rpc.cosigner.GetNonces(

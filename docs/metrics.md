@@ -73,6 +73,32 @@ Watch 'signer_missed_ephemeral_shares' which will note when the leader is not ab
 
 Each block, Nonce Secrets are shared between Cosigners.  Monitoring 'signer_seconds_since_last_local_ephemeral_share_time' and ensuring it does not exceed the block time will allow you to know when a Cosigner was not contacted for a block.
 
+## Watching Vote Extension Re-signing
+
+'signer_total_vote_extension_resigns' counts the times a sentry asked for a vote
+horcrux had already signed but with a different vote extension, so horcrux signed
+that extension again under fresh nonces. A low rate is normal after a sentry
+restart. A rate approaching one per block points at a sentry that keeps retrying,
+and each re-sign consumes an extra pair of nonce rounds. A re-signed extension is
+not written back to the sign state, so an application that builds a different
+extension on every request sustains that rate indefinitely rather than settling
+after one retry.
+
+## Watching per-node outcomes with two chain nodes
+
+`signer_total_chain_node_sign_results` counts sign-attempt outcomes per chain
+node: `signed` (a signature was returned, whether fresh or an existing one),
+`refused` (a terminal answer such as a stale request — the node keeps its
+connection and moves on), and `dropped` (the connection was closed so the node
+retries a transient failure). Requests rejected before a sign attempt (invalid
+chain ID, malformed request) are not counted, so the three results do not sum
+to total requests; `dropped` counts the same events as
+`signer_total_abandoned_sign_requests`, with the node label added. With two
+nodes behind one cluster, a healthy pair shows both nodes accumulating
+`signed`, the slower node some `refused`, and `dropped` near zero. A sustained
+`dropped` rate on one node means transient failures, not staleness —
+investigate the cluster, not the node.
+
 ## Metrics that don't always correspond to block time
 There is no guarantee that a Cosigner will sign a block if the threshold is reached early.  You may watch 'signer_seconds_since_last_local_sign_start_time' but there is no guarantee that 'signer_seconds_since_last_local_sign_finish_time' will be reached since there are multiple sanity checks that may cause an early exit in some circumstances (rather rare)
 

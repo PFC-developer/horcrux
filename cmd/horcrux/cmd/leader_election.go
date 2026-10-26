@@ -12,7 +12,6 @@ import (
 	"github.com/strangelove-ventures/horcrux/v3/signer/multiresolver"
 	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func init() {
@@ -50,9 +49,18 @@ horcrux elect 2 # elect specific leader`,
 				return err
 			}
 
+			clusterTLS, err := signer.ClusterTLSConfig(&config)
+			if err != nil {
+				return err
+			}
+
 			fmt.Printf("Broadcasting to address: %s\n", grpcAddress)
+			// grpc.Dial defaults to the passthrough resolver (per-attempt lookup by the
+			// dialer). A migration to grpc.NewClient must keep that via an explicit
+			// passthrough:/// target — NewClient defaults to the dns resolver instead.
 			conn, err := grpc.Dial(grpcAddress,
-				grpc.WithDefaultServiceConfig(serviceConfig), grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithDefaultServiceConfig(serviceConfig),
+				grpc.WithTransportCredentials(signer.ClusterTransportCreds(clusterTLS)),
 				grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 				grpc.WithUnaryInterceptor(grpcretry.UnaryClientInterceptor(retryOpts...)))
 			if err != nil {
@@ -153,9 +161,17 @@ func getLeaderCmd() *cobra.Command {
 				return err
 			}
 
+			clusterTLS, err := signer.ClusterTLSConfig(&config)
+			if err != nil {
+				return err
+			}
+
 			fmt.Printf("Request address: %s\n", grpcAddress)
+			// grpc.Dial defaults to the passthrough resolver (per-attempt lookup by the
+			// dialer). A migration to grpc.NewClient must keep that via an explicit
+			// passthrough:/// target — NewClient defaults to the dns resolver instead.
 			conn, err := grpc.Dial(grpcAddress,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithTransportCredentials(signer.ClusterTransportCreds(clusterTLS)),
 				grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 				grpc.WithUnaryInterceptor(grpcretry.UnaryClientInterceptor(retryOpts...)))
 			if err != nil {
@@ -178,5 +194,4 @@ func getLeaderCmd() *cobra.Command {
 			return nil
 		},
 	}
-
 }
